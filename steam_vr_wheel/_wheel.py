@@ -301,7 +301,7 @@ class Wheel(RightTrackpadAxisDisablerMixin, VirtualPad):
         self._right_controller_grabbed = False
 
     def point_in_holding_bounds(self, point):
-        width = 0.10
+        width = 0.10  # Original width
         a = self.size/2 + width
         b = self.size/2 - width
         if self.config.vertical_wheel:
@@ -452,18 +452,72 @@ class Wheel(RightTrackpadAxisDisablerMixin, VirtualPad):
         if self._grab_started_point:
             self._turn_speed = self._wheel_angles[-1] - self._wheel_angles[-2]
         else:
+            # Check if we're beyond the max angle
+            max_angle = (self.config.wheel_degrees / 360) * pi
+            is_overturned = abs(self._wheel_angles[-1]) > max_angle
+            
+            # When overturned and released, start returning to valid range
+            if is_overturned:
+                # Calculate how far we're into the redzone
+                over_amount = abs(self._wheel_angles[-1]) - max_angle
+                over_ratio = min(over_amount / (max_angle * 0.2), 1.0)  # Cap at 1.0
+                
+                # Set turn speed based on how far we're overturned
+                # More overturned = faster initial return
+                sign = -1 if self._wheel_angles[-1] > 0 else 1
+                return_speed = 0.01 + (over_ratio * 0.02)  # 0.01 to 0.03 based on overturning
+                
+                # Only override current turn speed if it's not already returning faster
+                if abs(self._turn_speed * sign) < return_speed:
+                    self._turn_speed = sign * return_speed
+            
             self._wheel_angles.append(self._wheel_angles[-1] + self._turn_speed)
-            self._turn_speed *= self._inertia
+            
+            # Apply inertia (wheel slowdown)
+            # Different inertia based on wheel position
+            if not is_overturned:
+                # Normal inertia within valid range
+                self._turn_speed *= self._inertia
+            else:
+                # Smoother, more gradual return from overturned position
+                # Higher value = more inertial feeling
+                self._turn_speed *= self._inertia * 0.95
 
     def center_force(self):
         angle = self._wheel_angles[-1]
         sign = 1
         if angle < 0:
             sign = -1
-        if abs(angle) < self._center_speed * self.config.wheel_centerforce:
+            
+        # Check if we're beyond the max angle
+        max_angle = (self.config.wheel_degrees / 360) * pi
+        is_overturned = abs(angle) > max_angle
+        
+        # Calculate center force based on position
+        base_center_force = self._center_speed * self.config.wheel_centerforce
+        
+        if is_overturned:
+            # For overturned wheel, use a more moderate centering force
+            # This prevents the wheel from snapping back too aggressively
+            # but still returns faster than normal
+            center_force = base_center_force * 1.5
+        else:
+            # Normal centering force within valid range
+            center_force = base_center_force
+            
+            # Progressively increase force as we approach the limits
+            # This gives a more realistic feeling of resistance near the edges
+            limit_factor = abs(angle) / max_angle
+            if limit_factor > 0.7:  # When we're beyond 70% of the max angle
+                # Add up to 25% more force near the limits
+                center_force *= (1 + (limit_factor - 0.7) * 0.8)
+        
+        # If very close to center, snap to exact center
+        if abs(angle) < center_force:
             self._wheel_angles[-1] = 0
             return
-        self._wheel_angles[-1] -= self._center_speed * self.config.wheel_centerforce * sign
+            
+        self._wheel_angles[-1] -= center_force * sign
 
     def send_to_vjoy(self):
         wheel_turn = self._wheel_angles[-1] / (2 * pi)
@@ -478,11 +532,33 @@ class Wheel(RightTrackpadAxisDisablerMixin, VirtualPad):
             self.wheel_image.rotate([-wheel_angle, np.pi / 2], [2, 0])
 
     def limiter(self, left_ctr, right_ctr):
-        if abs(self._wheel_angles[-1])/(2*pi)>(self.config.wheel_degrees / 360)/2:
-            self._wheel_angles[-1] = self._wheel_angles[-2]
-            openvr.VRSystem().triggerHapticPulse(left_ctr.id, 0, 3000)
-            openvr.VRSystem().triggerHapticPulse(right_ctr
-                                                    .id, 0, 3000)
+        max_angle = (self.config.wheel_degrees / 360) * pi
+        
+        # If we exceed the maximum angle
+        if abs(self._wheel_angles[-1]) > max_angle:
+            # Instead of freezing, let's apply resistance
+            # Cap the angle at the maximum but with a bit of elasticity
+            over_angle = abs(self._wheel_angles[-1]) - max_angle
+            sign = 1 if self._wheel_angles[-1] > 0 else -1
+            
+            # Allow slight overturning with increased resistance
+            elasticity = 0.25  # Slightly reduced from 0.3 to make limits feel more defined
+            resistance = 0.7  # How much to resist overturning (higher = more resistance)
+            
+            # Apply elastic resistance
+            allowed_over = max_angle + (over_angle * elasticity)
+            self._wheel_angles[-1] = sign * min(abs(self._wheel_angles[-1]), allowed_over)
+            
+            # Apply progressive haptic feedback that increases with overturning
+            # Gentler base haptic with smoother progression
+            base_haptic = 1500  # Lower base value for softer initial feedback
+            haptic_intensity = min(int(base_haptic + (over_angle * 2500)), 3999)
+            
+            # Only apply haptic when actively turning past the limit
+            # Increased threshold slightly to reduce constant buzzing
+            if abs(self._wheel_angles[-1] - self._wheel_angles[-2]) > 0.015:
+                openvr.VRSystem().triggerHapticPulse(left_ctr.id, 0, haptic_intensity)
+                openvr.VRSystem().triggerHapticPulse(right_ctr.id, 0, haptic_intensity)
 
 
     def render_hands(self):
@@ -510,11 +586,18 @@ class Wheel(RightTrackpadAxisDisablerMixin, VirtualPad):
             self._wheel_angles.append(angle)
 
         self.unwrap_wheel_angles()
-
+        
+        # Apply limiters before inertia to handle overturning
+        self.limiter(left_ctr, right_ctr)
+        
+        # Apply inertia
         self.inertia()
+        
+        # Apply centering force when not being held
         if (not self._left_controller_grabbed) and (not self._right_controller_grabbed):
             self.center_force()
-        self.limiter(left_ctr, right_ctr)
+            
+        # Send final position to vjoy
         self.send_to_vjoy()
 
 
